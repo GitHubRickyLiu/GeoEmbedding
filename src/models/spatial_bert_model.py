@@ -6,6 +6,11 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss, MarginRankingLoss
+from pytorch_metric_learning import losses
+from pytorch_metric_learning.distances import CosineSimilarity
+from pytorch_metric_learning.reducers import ThresholdReducer
+from pytorch_metric_learning.utils import loss_and_miner_utils as lmu
+import torch.nn.functional as F
 # from typing import List, Optional, Tuple, Union
 
 import transformers 
@@ -262,9 +267,11 @@ class SpatialEmbedding(nn.Module):
         input_shape = input_ids.size()
 
         seq_length = input_shape[1]
+        # 词嵌入
         embeddings = self.word_embeddings(input_ids)
         #pdb.set_trace()
         
+        # 空间坐标嵌入 (经纬度)
         if self.use_spatial_distance_embedding:
             if len(spatial_position_list_x) != 0 and len(spatial_position_list_y) !=0:
                 if self.spatial_position_embedding_type == "absolute":
@@ -284,7 +291,7 @@ class SpatialEmbedding(nn.Module):
         else:
             pass
 
-
+        # 句子位置嵌入
         if self.sent_position_embedding_type == "absolute":
             pos_emb_sent = self.sent_position_embedding(sent_position_ids)
             embeddings += pos_emb_sent
@@ -295,6 +302,7 @@ class SpatialEmbedding(nn.Module):
         if token_type_ids is None:
             token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
         
+        # 词类型嵌入
         token_type_embeddings = self.token_type_embeddings(token_type_ids)
         embeddings += token_type_embeddings 
 
@@ -621,13 +629,14 @@ class SpatialBertForMaskedLM(SpatialBertPreTrainedModel):
         sent_position_ids = None,
         spatial_position_list_x = None,
         spatial_position_list_y = None,
-        pivot_token_idx_list = None, 
+        pivot_token_idx_list = None,
         head_mask=None,
         encoder_attention_mask=None,
         labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        return_geo_nl_embeddings=False,  # 新增参数：是否返回geo和nl的实体嵌入
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
@@ -668,16 +677,24 @@ class SpatialBertForMaskedLM(SpatialBertPreTrainedModel):
 
         if not return_dict:
             output = (prediction_scores,) + outputs[2:]
+            if return_geo_nl_embeddings:
+                output = output + (pooled_output,)  # 添加实体嵌入到输出
             pdb.set_trace()
             print('inside MLM', output.shape)
             return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
 
-        return MaskedLMOutput(
+        result = MaskedLMOutput(
             loss=masked_lm_loss,
             logits=prediction_scores,
             hidden_states=pooled_output,
             attentions=outputs.attentions,
         )
+
+        if return_geo_nl_embeddings:
+            # 如果需要返回geo和nl嵌入，添加到结果中
+            result.geo_nl_embeddings = pooled_output
+
+        return result
 
 
     def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **model_kwargs):
@@ -935,3 +952,126 @@ class SpatialBertForTokenClassification(SpatialBertPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+
+class SpatialContrastiveLoss(nn.Module):
+    """
+    空间对比学习损失：使得拼接嵌入之间的距离与现实空间距离相近
+    """
+    def __init__(self, temperature=0.1, distance_threshold=1000):
+        super().__init__()
+        self.temperature = temperature
+        self.distance_threshold = distance_threshold  # 距离阈值，用于定义正负样本
+
+    def forward(self, embeddings, coordinates):
+        """
+        Args:
+            embeddings: [batch_size, hidden_size] 拼接后的实体嵌入
+            coordinates: [batch_size, 2] 经纬度坐标 [lng, lat]
+        """
+        batch_size = embeddings.shape[0]
+
+        # 计算所有实体对之间的欧几里得距离（经纬度）
+        coord_diff = coordinates.unsqueeze(0) - coordinates.unsqueeze(1)  # [batch_size, batch_size, 2]
+        spatial_distances = torch.sqrt(torch.sum(coord_diff ** 2, dim=-1))  # [batch_size, batch_size]
+
+        # 计算嵌入之间的余弦相似度
+        embedding_sim = F.cosine_similarity(
+            embeddings.unsqueeze(0), embeddings.unsqueeze(1), dim=-1
+        )  # [batch_size, batch_size]
+
+        # 创建标签：空间距离小于阈值认为是正样本（相似），否则为负样本（不相似）
+        positive_mask = spatial_distances < self.distance_threshold
+        negative_mask = spatial_distances >= self.distance_threshold
+
+        # 去除自相似（对角线）
+        positive_mask.fill_diagonal_(False)
+        negative_mask.fill_diagonal_(False)
+
+        # 计算对比损失
+        # 对于每个正样本对，计算与负样本的对比损失
+        loss = embeddings.new_tensor(0.0)
+        num_positive_pairs = 0
+
+        for i in range(batch_size):
+            for j in range(batch_size):
+                if positive_mask[i, j]:
+                    # 正样本对 (i,j)
+                    pos_sim = embedding_sim[i, j]
+
+                    # 负样本：所有与i或j距离远的实体
+                    neg_mask_i = negative_mask[i]  # 与i距离远的实体
+                    neg_mask_j = negative_mask[j]  # 与j距离远的实体
+                    neg_mask = torch.logical_or(neg_mask_i, neg_mask_j)  # 任一与i或j距离远的实体
+
+                    neg_indices = neg_mask.nonzero(as_tuple=False).squeeze(-1)
+
+                    if neg_indices.numel() > 0:
+                        neg_sims = torch.cat(
+                            [
+                                embedding_sim[i, neg_indices],
+                                embedding_sim[j, neg_indices],
+                            ],
+                            dim=0,
+                        )
+                        # InfoNCE损失
+                        logits = torch.cat([pos_sim.unsqueeze(0), neg_sims]) / self.temperature
+                        labels = torch.zeros(1, dtype=torch.long, device=embeddings.device)
+                        loss = loss + F.cross_entropy(logits.unsqueeze(0), labels)
+                        num_positive_pairs += 1
+
+        if num_positive_pairs > 0:
+            loss = loss / num_positive_pairs
+        else:
+            loss = torch.tensor(0.0, device=embeddings.device)
+
+        return loss
+
+
+class SpatialTripletLoss(nn.Module):
+    """
+    基于三元组的空间对比学习损失
+    """
+    def __init__(self, margin=1.0, distance_threshold=1000):
+        super().__init__()
+        self.margin = margin
+        self.distance_threshold = distance_threshold
+
+    def forward(self, embeddings, coordinates):
+        """
+        Args:
+            embeddings: [batch_size, hidden_size] 拼接后的实体嵌入
+            coordinates: [batch_size, 2] 经纬度坐标 [lng, lat]
+        """
+        batch_size = embeddings.shape[0]
+
+        # 计算空间距离
+        coord_diff = coordinates.unsqueeze(0) - coordinates.unsqueeze(1)
+        spatial_distances = torch.sqrt(torch.sum(coord_diff ** 2, dim=-1))
+
+        loss = 0.0
+        num_triplets = 0
+
+        for i in range(batch_size):
+            for j in range(batch_size):
+                for k in range(batch_size):
+                    if i != j and j != k and i != k:
+                        # 如果 (i,j) 空间距离近，(i,k) 空间距离远，则构成三元组
+                        if (spatial_distances[i, j] < self.distance_threshold and
+                            spatial_distances[i, k] >= self.distance_threshold):
+
+                            # 计算嵌入距离
+                            emb_dist_pos = torch.norm(embeddings[i] - embeddings[j])  # anchor和positive的距离
+                            emb_dist_neg = torch.norm(embeddings[i] - embeddings[k])  # anchor和negative的距离
+
+                            # 三元组损失：max(0, dist(anchor,positive) - dist(anchor,negative) + margin)
+                            triplet_loss = F.relu(emb_dist_pos - emb_dist_neg + self.margin)
+                            loss += triplet_loss
+                            num_triplets += 1
+
+        if num_triplets > 0:
+            loss = loss / num_triplets
+        else:
+            loss = torch.tensor(0.0, device=embeddings.device)
+
+        return loss

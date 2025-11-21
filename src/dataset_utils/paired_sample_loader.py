@@ -60,30 +60,40 @@ class JointDataset(SpatialDataset):
 
     def prepare_nl_data(self, pivot_osm_id):
 
+        #根据OSM ID获取对应的自然语言数据
         nl_sample_dict = self.nl_data[pivot_osm_id]
+        #获取自然语言句子列表
         sentences = nl_sample_dict['sentence']
+        #主题词在句子中的字符位置
         subject_index_list = nl_sample_dict['subject_index_list']
 
+        #随机选择一个句子
         sample_idx = np.random.randint(len(sentences))
         sent = sentences[sample_idx]
+        #获取主题词在句子中的字符位置
         subject_schar, subject_tchar = subject_index_list[sample_idx] # start and end index in character
 
+        #使用tokenizer进行分词，获取token ID序列和偏移映射
         nl_tokens = self.tokenizer(sent,  padding="max_length", max_length=self.max_token_len, truncation = True, return_offsets_mapping = True)
+        # token ID序列
         pseudo_sentence = nl_tokens['input_ids']
 
-        rand = np.random.uniform(size = self.max_token_len)  
-        
+        # 生成随机数决定哪些token要被掩码（15%的概率）
+        rand = np.random.uniform(size = self.max_token_len)         
+        # 掩码条件：随机数小于0.15，且不是CLS、SEP或PAD token
         mlm_mask_arr = (rand <0.15) & (np.array(pseudo_sentence) != self.cls_token_id) & (np.array(pseudo_sentence) != self.sep_token_id) & (np.array(pseudo_sentence) != self.pad_token_id)
-
+        # 掩码token的索引
         token_mask_indices = np.where(mlm_mask_arr)[0]
-        
+        # 掩码后的token ID序列
         masked_token_input = [self.mask_token_id if i in token_mask_indices else pseudo_sentence[i] for i in range(0, self.max_token_len)]
 
-        
+        # 每个token对应的原始字符位置
         offset_mapping = nl_tokens['offset_mapping'][1:-1]
         flat_offset_mapping = np.array(offset_mapping).flatten()
+        # 通过字符偏移映射找到主题词对应的token位置
         offset_mapping_dict_start = {}
         offset_mapping_dict_end = {}
+        # 构建字符位置到token位置的映射
         for idx in range(0,len(flat_offset_mapping),2):
             char_pos = flat_offset_mapping[idx]
             if char_pos == 0 and idx != 0:
@@ -111,22 +121,33 @@ class JointDataset(SpatialDataset):
             print(self.tokenizer.convert_ids_to_tokens(pseudo_sentence))
             print('\n')
         # token end index is exclusive
+        #找到主题词的token起始和结束位置
         token_start_idx, token_end_idx = offset_mapping_dict_start[subject_schar],offset_mapping_dict_end[subject_tchar]
         assert token_start_idx < token_end_idx # can not be equal
 
-        
+        # 构建自然语言伪句子数据
         train_data = {}
+        # 掩码后的token ID序列
         train_data['masked_input'] = torch.tensor(masked_token_input)
+        # 主题词在句子中的token位置
         train_data['pivot_token_idx'] = torch.tensor([token_start_idx, token_end_idx])
-
+        # 原始句子
         train_data['pseudo_sentence'] = torch.tensor(pseudo_sentence)
+        # 实际句子长度
         train_data['sent_len'] = torch.tensor(np.sum(np.array(nl_tokens['attention_mask']) == 1)) # pseudo sentence length including CLS and SEP token
+        # 注意力掩码
         train_data['attention_mask'] = torch.tensor(nl_tokens['attention_mask'])
+        # 句子位置ID
         train_data['sent_position_ids'] = torch.tensor(np.arange(0, len(pseudo_sentence)))
+       
         # train_data['norm_lng_list'] = torch.tensor([self.spatial_dist_fill for i in range(len(pseudo_sentence))]).to(torch.float32)
         # train_data['norm_lat_list'] = torch.tensor([self.spatial_dist_fill for i in range(len(pseudo_sentence))]).to(torch.float32)
+        
+        # 自然语言数据经度为0
         train_data['norm_lng_list'] = torch.tensor([0 for i in range(len(pseudo_sentence))]).to(torch.float32)
+        # 自然语言数据纬度为0
         train_data['norm_lat_list'] = torch.tensor([0 for i in range(len(pseudo_sentence))]).to(torch.float32)
+        # token类型ID，0表示自然语言
         train_data['token_type_ids'] =  torch.zeros(len(pseudo_sentence)).int() # 0 for nl data
 
         return train_data
@@ -144,15 +165,18 @@ class JointDataset(SpatialDataset):
         # print(neighbor_geometry_list)
 
         train_data = {}
+        # 地理伪句子数据，来源于dataset_loader.py中SpatialDataset类的parse_spatial_context函数
         train_data['geo_data'] = self.parse_spatial_context(pivot_name, pivot_pos, neighbor_name_list, neighbor_geometry_list, self.spatial_dist_fill )
         train_data['geo_data']['token_type_ids'] = torch.ones( len(train_data['geo_data']['pseudo_sentence'])).int() # type 1 for geo data 
         train_data['geo_data']['sent_len'] =  torch.sum((train_data['geo_data']['attention_mask']) == 1) # pseudo sentence length including CLS and SEP token
+        # 自然语言伪句子数据，来源于JointDataset类的prepare_nl_data函数
         train_data['nl_data'] = self.prepare_nl_data(pivot_osm_id)
 
         train_data['concat_data'] = {}
-        nl_data_len = train_data['nl_data']['sent_len']
-        geo_data_len = train_data['geo_data']['sent_len']
+        nl_data_len = train_data['nl_data']['sent_len']# 自然语言句子实际长度
+        geo_data_len = train_data['geo_data']['sent_len'] # 地理伪句子实际长度
 
+        # 如果总长度小于max_token_len，则取完整句子（移除地理伪句子前的[CLS]）
         if nl_data_len + geo_data_len <= self.max_token_len: 
             # if the total length is smaller than max_token_len, take the full sentence (remove [CLS] before geo sentence)
             # print (train_data['nl_data']['masked_input'][:nl_data_len].shape, train_data['geo_data']['masked_input'][1 : self.max_token_len - nl_data_len + 1].shape)
@@ -164,6 +188,7 @@ class JointDataset(SpatialDataset):
             
         else:
             # otherwise, 
+             # 情况2：自然语言部分不长于一半长度，截断地理部分
             if nl_data_len <= self.max_token_len / 2 : 
                 # if the nl_data_len is <=  0.5 * max_token_len, then truncate geodata 
                 # concat geo data , remove [CLS] from geo_data
@@ -174,9 +199,9 @@ class JointDataset(SpatialDataset):
                 train_data['concat_data']['sent_position_ids'] = torch.cat((train_data['nl_data']['sent_position_ids'][:nl_data_len] , train_data['geo_data']['sent_position_ids'][1 : self.max_token_len - nl_data_len ] , torch.tensor([self.max_token_len - nl_data_len])))
                 train_data['concat_data']['pseudo_sentence'] = torch.cat((train_data['nl_data']['pseudo_sentence'][:nl_data_len] , train_data['geo_data']['pseudo_sentence'][1 : self.max_token_len - nl_data_len ] , torch.tensor([self.sep_token_id])))
                 train_data['concat_data']['token_type_ids'] = torch.cat((train_data['nl_data']['token_type_ids'][:nl_data_len] , train_data['geo_data']['token_type_ids'][1 : self.max_token_len - nl_data_len ] , torch.tensor([1])))
-                
-            else:
-                
+            
+            # 情况3：自然语言部分过长，各取一半    
+            else:               
                 train_data['concat_data']['masked_input'] = torch.cat((train_data['nl_data']['masked_input'][:self.max_token_len // 2 - 1], torch.tensor([self.sep_token_id]) , train_data['geo_data']['masked_input'][1 : self.max_token_len//2 ], torch.tensor([self.sep_token_id])))
                 train_data['concat_data']['attention_mask'] = torch.cat((train_data['nl_data']['attention_mask'][:self.max_token_len // 2 - 1], torch.tensor([1]) , train_data['geo_data']['attention_mask'][1 : self.max_token_len//2 ], torch.tensor([0])))
                 train_data['concat_data']['sent_position_ids'] = torch.cat((train_data['nl_data']['sent_position_ids'][:self.max_token_len // 2 - 1], torch.tensor([self.max_token_len // 2 - 1]) , train_data['geo_data']['sent_position_ids'][1 : self.max_token_len//2 ], torch.tensor([self.max_token_len//2])))
@@ -204,9 +229,12 @@ class JointDataset(SpatialDataset):
         else:
             line = self.geo_data[index] # take one line from the input data according to the index
 
+        # 将geo_data中的JSON字符串line转换为字典
         geo_line_data_dict = json.loads(line)
 
+        # 确保对应的OSM ID在自然语言数据中存在
         while geo_line_data_dict['info']['osm_id'] not in self.nl_data:
+             # 如果不存在，随机选择其他行
             line = self.geo_data[np.random.randint(self.len_geo_data)]
             geo_line_data_dict = json.loads(line)
 

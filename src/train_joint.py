@@ -11,6 +11,7 @@ sys.path.append('../../../')
 from models.spatial_bert_model import SpatialBertModel
 from models.spatial_bert_model import SpatialBertConfig
 from models.spatial_bert_model import  SpatialBertForMaskedLM
+from models.spatial_bert_model import SpatialContrastiveLoss, SpatialTripletLoss
 from dataset_utils.osm_sample_loader import PbfMapDataset
 from dataset_utils.paired_sample_loader import JointDataset
 from transformers.models.bert.modeling_bert import BertForMaskedLM
@@ -185,6 +186,7 @@ def training(args):
     optim = torch.optim.AdamW(model.parameters(), lr = lr)
 
     contrastive_criterion = losses.NTXentLoss(temperature=0.01)
+    spatial_contrastive_criterion = SpatialContrastiveLoss(temperature=0.1, distance_threshold=1000)
 
     if args.checkpoint_weight is not None:
         print('load weights from checkpoint', args.checkpoint_weight)
@@ -203,27 +205,29 @@ def training(args):
 
             with torch.autocast(device_type = 'cuda', dtype = torch.float16, enabled = use_amp):
                 
-                nl_data = batch['nl_data']
-                geo_data = batch['geo_data']
-                concat_data = batch['concat_data']
+                #从batch中提取三种数据
+                nl_data = batch['nl_data']# 自然语言数据
+                geo_data = batch['geo_data']# 地理数据  
+                concat_data = batch['concat_data']# 拼接数据
                 
-                nl_input_ids = nl_data['masked_input'].to(device)
-                nl_entity_token_idx = nl_data['pivot_token_idx'].to(device)
-                nl_attention_mask = nl_data['attention_mask'].to(device)
+                #分别提取每种数据的各个字段
+                nl_input_ids = nl_data['masked_input'].to(device)# 自然语言数据掩码后的token ID序列
+                nl_entity_token_idx = nl_data['pivot_token_idx'].to(device)# 自然语言数据主题词在句子中的token位置
+                nl_attention_mask = nl_data['attention_mask'].to(device)# 自然语言数据注意力掩码
                 nl_position_list_x = nl_data['norm_lng_list'].to(device)
-                nl_position_list_y = nl_data['norm_lat_list'].to(device)
-                nl_sent_position_ids = nl_data['sent_position_ids'].to(device)
-                nl_pseudo_sentence = nl_data['pseudo_sentence'].to(device)
-                nl_token_type_ids = nl_data['token_type_ids'].to(device)
+                nl_position_list_y = nl_data['norm_lat_list'].to(device)# 自然语言数据纬度距离归一化列表
+                nl_sent_position_ids = nl_data['sent_position_ids'].to(device)# 自然语言数据句子位置ID
+                nl_pseudo_sentence = nl_data['pseudo_sentence'].to(device)# 自然语言数据原始句子
+                nl_token_type_ids = nl_data['token_type_ids'].to(device)# 自然语言数据token类型ID
 
-                geo_input_ids = geo_data['masked_input'].to(device)
-                geo_entity_token_idx = geo_data['pivot_token_idx'].to(device)
-                geo_attention_mask = geo_data['attention_mask'].to(device)
+                geo_input_ids = geo_data['masked_input'].to(device)# 地理数据掩码后的token ID序列
+                geo_entity_token_idx = geo_data['pivot_token_idx'].to(device)# 地理数据主题词在句子中的token位置
+                geo_attention_mask = geo_data['attention_mask'].to(device)# 地理数据注意力掩码
                 geo_position_list_x = geo_data['norm_lng_list'].to(device)
-                geo_position_list_y = geo_data['norm_lat_list'].to(device)
+                geo_position_list_y = geo_data['norm_lat_list'].to(device)# 地理数据纬度距离归一化列表
                 geo_sent_position_ids = geo_data['sent_position_ids'].to(device)
-                geo_pseudo_sentence = geo_data['pseudo_sentence'].to(device)
-                geo_token_type_ids = geo_data['token_type_ids'].to(device)
+                geo_pseudo_sentence = geo_data['pseudo_sentence'].to(device)# 地理数据原始句子
+                geo_token_type_ids = geo_data['token_type_ids'].to(device)# 地理数据token类型ID     
 
                 joint_input_ids = concat_data['masked_input'].to(device)
                 joint_attention_mask = concat_data['attention_mask'].to(device)
@@ -236,6 +240,7 @@ def training(args):
 
 
                 try:
+                    #
                     outputs1 = model(joint_input_ids, attention_mask = joint_attention_mask, sent_position_ids = joint_sent_position_ids, pivot_token_idx_list=None,
                         spatial_position_list_x = joint_position_list_x, spatial_position_list_y = joint_position_list_y, token_type_ids = joint_token_type_ids, labels = joint_pseudo_sentence)
                 except Exception as e:
@@ -243,7 +248,7 @@ def training(args):
                     pdb.set_trace()
 
                 # mlm for on joint geo and nl data 
-
+                #MLM损失（拼接数据）
                 loss1 = outputs1.loss
 
                 # loss1.backward()
@@ -255,13 +260,14 @@ def training(args):
                 scaler.update()
                 optim.zero_grad()
 
-
+                # 2. 地理数据的实体表示提取
                 outputs1 = model(geo_pseudo_sentence, attention_mask = geo_attention_mask, sent_position_ids = geo_sent_position_ids, pivot_token_idx_list=geo_entity_token_idx,
                     spatial_position_list_x = geo_position_list_x, spatial_position_list_y = geo_position_list_y, token_type_ids = geo_token_type_ids, labels = None)
-
+                # 3. 自然语言数据的实体表示提取
                 outputs2 = model(nl_pseudo_sentence, attention_mask = nl_attention_mask, sent_position_ids = nl_sent_position_ids,pivot_token_idx_list=nl_entity_token_idx,
                     spatial_position_list_x = nl_position_list_x, spatial_position_list_y = nl_position_list_y, token_type_ids = nl_token_type_ids, labels = None)
 
+                #对比学习损失（地理vs自然语言实体表示）
                 embedding = torch.cat((outputs1.hidden_states, outputs2.hidden_states), 0)
                 indicator = torch.arange(0, batch_size, dtype=torch.float32, requires_grad=False).to(device)
                 indicator = torch.cat((indicator, indicator),0)
@@ -269,20 +275,38 @@ def training(args):
 
                 if torch.isnan(loss3):
                     print(nl_entity_token_idx)
-                    return 
+                    return
 
-                scaler.scale(loss3).backward()
+                # 空间对比学习损失：拼接geo和nl嵌入，使其与空间距离相近
+                geo_embeddings = outputs1.hidden_states  # [batch_size, hidden_size]
+                nl_embeddings = outputs2.hidden_states   # [batch_size, hidden_size]
+                concat_embeddings = torch.cat([geo_embeddings, nl_embeddings], dim=-1)  # [batch_size, 2*hidden_size]
+
+                geo_coordinates = torch.stack([
+                    geo_position_list_x[:, 0],
+                    geo_position_list_y[:, 0]
+                ], dim=1).to(device)  # [batch_size, 2]
+
+                loss4 = spatial_contrastive_criterion(concat_embeddings, geo_coordinates)
+
+                if torch.isnan(loss4):
+                    print("Spatial loss is NaN")
+                    loss4 = torch.tensor(0.0, device=device)
+
+                combined_contrastive_loss = loss3 + loss4
+
+                scaler.scale(combined_contrastive_loss).backward()
                 scaler.unscale_(optim)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
                 scaler.step(optim)
                 scaler.update()
                 optim.zero_grad()
 
-                loss = loss1 +  loss3
+                loss = loss1 + loss3 + loss4
                 # pdb.set_trace()
 
                 loop.set_description(f'Epoch {epoch}')
-                loop.set_postfix({'loss':loss.item(),'mlm':loss1.item(),'contrast':loss3.item()})
+                loop.set_postfix({'loss':loss.item(),'mlm':loss1.item(),'contrast':loss3.item(),'spatial':loss4.item()})
 
 
                 if DEBUG:
@@ -295,7 +319,9 @@ def training(args):
                     + '_' +str("{:.4f}".format(loss.item())) +'.pth' )
                     checkpoint = {"model": model.state_dict(),
                         "optimizer": optim.state_dict(),
-                        "scaler": scaler.state_dict()}
+                        "scaler": scaler.state_dict(),
+                        "epoch": epoch,
+                        "iter": iter}
                     torch.save(checkpoint, save_path)
                     print('saving model checkpoint to', save_path)
 
